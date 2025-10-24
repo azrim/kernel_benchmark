@@ -1,0 +1,17 @@
+# Ignore benchmark results directory
+ext4_benchmarks/
+
+# Ignore temporary benchmark directory
+benchmark/
+
+# Ignore log files
+*.log
+
+# Ignore JSON summary files
+*.json
+
+# Ignore temporary FIO files
+fio_temp
+
+# Ignore user-specific configuration file
+.ext4_benchmark.conf
