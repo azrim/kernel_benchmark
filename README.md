@@ -1,6 +1,6 @@
 # ext4 Filesystem Benchmark Suite
 
-![Banner](https://art.pixilart.com/37641d2745b6187.png)
+![Banner](https://art.pixilart.com/sr2941a02b309aws3.png)
 
 <p align="center">
   <a href="https://github.com/azrim/kernel_benchmark/blob/main/LICENSE">
