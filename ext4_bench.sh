@@ -81,7 +81,54 @@ cleanup_on_exit() {
 }
 
 # Set trap at script start
-trap cleanup_on_exit EXIT INT TERM
+# --- Signal Handling Setup ---
+# Global flag for cleanup
+CLEANUP_DONE=0
+
+cleanup_on_exit() {
+# Prevent multiple cleanup calls
+    if [ "$CLEANUP_DONE" -eq 1 ]; then
+        return
+    fi
+    CLEANUP_DONE=1
+    
+    local exit_code=$?
+# Disable further traps
+    trap - EXIT INT TERM HUP
+    
+    printf "\\n\\n${YELLOW}--- Cleaning up (please wait) ---${NC}\\n" >&2
+# Kill all child processes of this script
+    local children=$(jobs -p)
+    if [ -n "$children" ]; then
+        kill -TERM $children 2>/dev/null || true
+        sleep 1
+        kill -9 $children 2>/dev/null || true
+    fi
+# Stop specific monitoring PIDs
+    for pid in "$IOSTAT_PID" "$TEMP_MONITOR_PID"; do
+        if [ -n "$pid" ] && [ "$pid" -ne 0 ]; then
+            kill -9 "$pid" 2>/dev/null || true
+        fi
+    done
+# Restore CPU settings
+    [ -n "$ORIGINAL_CPU_GOVERNOR" ] && restore_cpu_governor "$ORIGINAL_CPU_GOVERNOR" 2>/dev/null || true
+    [ -n "$ORIGINAL_TURBO_STATE" ] && restore_turbo "$ORIGINAL_TURBO_STATE" 2>/dev/null || true
+# Clean test directory
+    if [ -n "$TEST_DIR_TO_CLEAN" ] && [ -d "$TEST_DIR_TO_CLEAN" ]; then
+        rm -rf "${TEST_DIR_TO_CLEAN:?}" 2>/dev/null || true
+    fi
+    
+    sync 2>/dev/null || true
+    
+    printf "${GREEN}Cleanup complete.${NC}\\n" >&2
+# Exit with appropriate code
+    [ $exit_code -eq 0 ] && exit 0 || exit $exit_code
+}
+
+# Set traps - separate handlers for different signals
+trap 'cleanup_on_exit' EXIT
+trap 'echo ""; echo "Ctrl+C detected. Cleaning up..."; exit 130' INT
+trap 'echo "Terminated. Cleaning up..."; exit 143' TERM
 
 # Configuration
 DEFAULT_MOUNT_POINT="/mnt/ext4_test"
@@ -89,7 +136,8 @@ DEFAULT_NUM_RUNS=3
 DEFAULT_NUM_FILES=1000
 DEFAULT_NUM_JOBS=1 # Default to 1 job for fio
 BLOCK_SIZE="4k"
-RESULTS_BASE_DIR="$HOME/ext4_benchmarks"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+RESULTS_BASE_DIR="$SCRIPT_DIR/ext4_benchmarks"
 
 # Colors for output
 RED='\033[0;31m'
@@ -171,13 +219,28 @@ check_tool() {
 # A. Better Statistical Analysis
 get_median() {
     local arr=("$@")
+    # Return 0 if no data
+    if [ ${#arr[@]} -eq 0 ]; then
+        echo "0"
+        return
+    fi
+    # Sort the array numerically
     local sorted=($(printf '%s\n' "${arr[@]}" | sort -n))
     local count=${#sorted[@]}
+    # Handle single element
+    if [ "$count" -eq 1 ]; then
+        echo "${sorted[0]}"
+        return
+    fi
+    
     local mid=$((count / 2))
     
     if [ $((count % 2)) -eq 0 ]; then
-        echo "scale=2; (${sorted[$mid-1]} + ${sorted[$mid]}) / 2" | bc
+        # Even number of elements - average the two middle values
+        local mid1=$((mid - 1))
+        echo "scale=2; (${sorted[$mid1]} + ${sorted[$mid]}) / 2" | bc -l
     else
+        # Odd number of elements - return the middle value
         echo "${sorted[$mid]}"
     fi
 }
@@ -358,35 +421,9 @@ capture_device_info() {
     printf "Device information captured to %s\n" "$output"
 }
 
-start_iostat_monitoring() {
-    local device=$1
-    local interval=5
-    local output_file=$2
-    
-    if command -v iostat &> /dev/null; then
-        iostat -x "$device" $interval >> "$output_file" &
-        echo $!  # Return PID to kill later
-    else
-        echo "0"
-    fi
-}
 
-monitor_temperature() {
-    local output_file=$1
-    
-    if command -v sensors &> /dev/null; then
-        (
-            echo "--- Temperature Log (started at $(date +%T)) ---" >> "$output_file"
-            while true; do
-                echo "[$(date +%T)] $(sensors 2>&1 | head -n 5)" >> "$output_file"
-                sleep 5
-            done
-        ) &
-        echo $!  # Return PID
-    else
-        echo "0"
-    fi
-}
+
+
 
 check_throttling() {
     local throttle_count=0
@@ -1165,9 +1202,15 @@ run_benchmark() {
         printf "\n${RED}Please install missing dependencies.${NC}\n"; read -p "Enter..."; return; fi
 
     # --- Pre-flight Checks & Setup ---
-    printf "Enter benchmark name (e.g., 'kernel-6.1'): "
-    local BENCHMARK_NAME; read -r BENCHMARK_NAME
-    BENCHMARK_NAME=${BENCHMARK_NAME:-"benchmark-$(date +%Y%m%d-%H%M%S)"}
+    echo ""
+    read -p "Enter benchmark name [default: auto-generated]: " BENCHMARK_NAME
+
+    if [[ -z "$BENCHMARK_NAME" ]]; then
+        BENCHMARK_NAME="kernel_$(uname -r | sed 's/[.-]/_/g')_$(date +%Y%m%d%H%M%S)"
+        echo "→ Using auto-generated name: ${BENCHMARK_NAME}"
+    else
+        echo "→ Using custom name: ${BENCHMARK_NAME}"
+    fi
 
     printf "Enter directory for benchmark (default: %s): " "$DEFAULT_MOUNT_POINT"
     local MOUNT_POINT; read -r MOUNT_POINT
@@ -1207,25 +1250,43 @@ run_benchmark() {
     set_process_priority
     check_throttling
     
-    # --- Start Monitoring ---
+    # --- Start Monitoring (simplified) ---
     echo "DEBUG: Capturing initial system state..."
     capture_system_state "$RESULTS_DIR/system_state_before.txt"
     echo "DEBUG: Capturing device information..."
     capture_device_info "$DEVICE" "$RESULTS_DIR/device_info.txt"
+
+    # Start iostat in background - simplified
     echo "DEBUG: Starting iostat monitoring..."
-    IOSTAT_PID=$(start_iostat_monitoring "$DEVICE" "$RESULTS_DIR/iostat.log")
-    echo "DEBUG: iostat started with PID $IOSTAT_PID."
+    if command -v iostat >/dev/null 2>&1; then
+        nohup iostat -x 5 >> "$RESULTS_DIR/iostat.log" 2>&1 &
+        IOSTAT_PID=$!
+        echo "DEBUG: iostat started with PID $IOSTAT_PID."
+    else
+        IOSTAT_PID=0
+        echo "DEBUG: iostat not available, skipping."
+    fi
+
+    # Start temperature monitoring - simplified
     echo "DEBUG: Starting temperature monitoring..."
-    TEMP_MONITOR_PID=$(monitor_temperature "$RESULTS_DIR/temperature.log")
-    echo "DEBUG: Temperature monitor started with PID $TEMP_MONITOR_PID."
+    if command -v sensors >/dev/null 2>&1; then
+        (while true; do sensors >> "$RESULTS_DIR/temperature.log" 2>&1; sleep 5; done) &
+        TEMP_MONITOR_PID=$!
+        echo "DEBUG: Temperature monitor started with PID $TEMP_MONITOR_PID."
+    else
+        TEMP_MONITOR_PID=0
+        echo "DEBUG: sensors not available, skipping."
+    fi
 
     # --- Start Logging ---
-    echo "DEBUG: Redirecting script output to log file..."
-    exec > >(tee -a "$RESULTS_DIR/benchmark_full.log") 2>&1
-    echo "DEBUG: Output redirected."
+    LOGFILE="$RESULTS_DIR/benchmark_full.log"
+    # Redirect all output to both console and log file
+    exec 1> >(tee -a "$LOGFILE")
+    exec 2>&1
     
     printf "Benchmark started: %s\n" "$(date)"
     printf "Results directory: %s\n" "$RESULTS_DIR"
+    echo ""
     
     # --- Arrays to store all run results for statistics ---
     declare -A results_seq_write results_seq_read results_rand_write results_rand_read results_mixed_read results_mixed_write results_file_create results_file_delete results_dir_create
@@ -1327,16 +1388,25 @@ run_benchmark() {
         done
         show_progress "$DEFAULT_NUM_FILES" "$DEFAULT_NUM_FILES" "Creating directories" "$start_time"
         sync
-        end_time=$(date +%s.%N)
-        elapsed=$(echo "$end_time - $start_time" | bc)
+        local end_time; end_time=$(date +%s.%N)
+        local elapsed; elapsed=$(echo "$end_time - $start_time" | bc)
         results_dir_create[$run]=$elapsed
         rm -rf "$dirs_dir"
         
         dmesg -T | tail -30 >> "$RESULTS_DIR/dmesg_after_run_${run}.log"
     done
+    
+    echo ""
+    echo "=== Benchmark Completed: $(date) ==="
+    
+    # Stop redirecting to tee
+    exec 1>&-
+    exec 2>&-
+    exec 1>/dev/tty
+    exec 2>&1
 
     # --- Finalize and Summarize ---
-    exec > /dev/tty 2>&1 # Restore stdout
+    # exec > /dev/tty 2>&1 # Restore stdout - no longer needed with tee
     
     printf "\n\n${GREEN}╔════════════════════════════════════════╗${NC}\n"
     printf "${GREEN}║         BENCHMARK RESULTS SUMMARY        ║${NC}\n"
